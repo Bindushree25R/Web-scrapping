@@ -1,0 +1,177 @@
+import time
+import urllib.parse
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import mysql.connector
+
+# MySQL Connection
+
+def connect_db():
+    return mysql.connector.connect(
+        host="localhost",
+        user="your_mysql_user",
+        password="your_mysql_password",
+        database="your_database"
+    )
+
+# Insert module into Modules table if not exists
+
+def insert_module_if_not_exists(db_conn, module_name):
+    if not module_name:
+        return
+    cursor = db_conn.cursor()
+    try:
+        cursor.execute("INSERT IGNORE INTO Modules (ModuleName) VALUES (%s)", (module_name,))
+        db_conn.commit()
+    except mysql.connector.Error as err:
+        print(f"❌ Error inserting module: {err}")
+
+# Get Requirement Module from issue detail page
+
+def get_requirement_module(driver, issue_url):
+    full_url = urllib.parse.urljoin(driver.current_url, issue_url)
+    driver.get(full_url)
+
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CLASS_NAME, "splitcontent"))
+        )
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+
+        label_tags = soup.find_all("div", class_="label")
+        for label_div in label_tags:
+            if label_div.text.strip() == "RequirementModules":
+                value_div = label_div.find_next_sibling("div", class_="value")
+                if value_div:
+                    return value_div.text.strip()
+        return None
+    except Exception as e:
+        print(f"❌ Error loading requirement module: {e}")
+        return None
+
+# Start Chrome Driver
+
+def start_driver():
+    options = Options()
+    options.add_argument("--no-sandbox")
+    service = Service("/home/opr/chromedriver")
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(30)
+    driver.implicitly_wait(10)
+    return driver
+
+# Login Function
+
+def login(driver):
+    driver.get("http://your-website-url")
+    username = input("Enter Your username:")
+    password = input("Enter Your Password:")
+
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.NAME, "username"))
+    ).send_keys(username)
+
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.NAME, "password"))
+    ).send_keys(password)
+
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.ID, "login_submit"))
+    ).click()
+
+    print("✅ Logged in successfully")
+
+# Go to Projects Page
+
+def go_to_projects_page(driver):
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.LINK_TEXT, "Projects"))
+    ).click()
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.ID, "projects-index"))
+    )
+    print("✅ Navigated to Projects page")
+
+# Scrape issues and extract module names only
+
+def scrape_issues_for_modules(driver, project_name, db_conn):
+    while True:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CLASS_NAME, "listissues"))
+        )
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        table = soup.find("table", class_="listissues")
+        if not table:
+            return
+
+        rows = table.find_all("tr")
+        for row in rows[1:]:  # Skip header
+            cols = row.find_all("td")
+            if not cols:
+                continue
+
+            try:
+                subject_cell = cols[1]
+                a_tag = subject_cell.find("a")
+                issue_url = a_tag['href'] if a_tag else None
+
+                requirement_module = get_requirement_module(driver, issue_url) if issue_url else None
+                insert_module_if_not_exists(db_conn, requirement_module)
+
+            except Exception as e:
+                print(f"❌ Error processing issue row: {e}")
+
+        try:
+            next_button = driver.find_element(By.LINK_TEXT, "Next ›")
+            if "disabled" in next_button.get_attribute("class"):
+                break
+            next_button.click()
+            time.sleep(2)
+        except:
+            break
+
+# Loop through all projects
+
+def visit_each_project_and_extract_modules(driver, db_conn):
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    project_ul = soup.find("ul", id="projects root")
+    if not project_ul:
+        print("❌ Project list not found.")
+        return
+
+    project_links = []
+    for li in project_ul.find_all("li", class_="root"):
+        a_tag = li.find("a")
+        if a_tag and a_tag.get("href"):
+            project_links.append((a_tag.text.strip(), a_tag['href']))
+
+    for name, href in project_links:
+        full_url = urllib.parse.urljoin(driver.current_url, href)
+        driver.get(full_url)
+        try:
+            issues_tab = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.LINK_TEXT, "Issues"))
+            )
+            issues_tab.click()
+            scrape_issues_for_modules(driver, name, db_conn)
+        except Exception as e:
+            print(f"❌ Could not process project '{name}': {e}")
+        time.sleep(2)
+
+# Main
+if __name__ == "__main__":
+    driver = start_driver()
+    db_conn = connect_db()
+
+    try:
+        login(driver)
+        go_to_projects_page(driver)
+        visit_each_project_and_extract_modules(driver, db_conn)
+    finally:
+        driver.quit()
+        db_conn.close()
